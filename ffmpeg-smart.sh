@@ -25,16 +25,16 @@ if [[ -z "$URL" ]]; then
     exit 1
 fi
 
-# Probe stream (silent)
+# Probe stream
 PROBE=$(ffprobe -v quiet -print_format json -show_streams "$URL" 2>&1) || {
     echo "$LOG_PREFIX ERROR: ffprobe failed - cannot access stream" >&2
     exit 1
 }
 
-# Parse streams
+# Parse streams by codec_type
 VCODEC=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .codec_name' | head -n1)
 FPS_FRAC=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .r_frame_rate' | head -n1)
-ABITRATE=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .bit_rate // "128000"' | head -n1)
+ABITRATE_RAW=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .bit_rate // empty' | head -n1)
 
 # Validate video stream
 if [[ -z "$VCODEC" || "$VCODEC" == "null" ]]; then
@@ -50,8 +50,14 @@ elif [[ "$VCODEC" == "h264" ]]; then
 elif [[ "$VCODEC" == "mpeg2video" ]]; then
     VCODEC_OUT="mpeg2_qsv"
 else
-    # Fallback: transcode unknown codecs to H.264
     VCODEC_OUT="h264_qsv"
+fi
+
+# Validate audio bitrate (reject sample rates like 44100/48000)
+if [[ -n "$ABITRATE_RAW" ]] && [[ "$ABITRATE_RAW" -ge 60000 ]] && [[ "$ABITRATE_RAW" -le 500000 ]]; then
+    ABITRATE="$ABITRATE_RAW"
+else
+    ABITRATE="128000"
 fi
 
 # Bitrates
@@ -70,7 +76,7 @@ else
     GOP_WARN=" (fps parse failed)"
 fi
 
-# Single combined log line with all info
+# Single combined log line
 echo "$LOG_PREFIX Detected $VCODEC @ $FPS_FRAC -> $VCODEC_OUT GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps" >&2
 
 # Execute ffmpeg
