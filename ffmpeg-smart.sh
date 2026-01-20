@@ -117,6 +117,7 @@ exec ffmpeg \
   -fps_mode cfr \
   -r "$FPS_OUT" \
   -async 1 \
+  $TAG_ARGS \
   -c:a aac \
   -b:a "$ABITRATE" \
   -af "aresample=async=1" \
