@@ -6,7 +6,6 @@ LOG_PREFIX="[ffmpeg-smart]"
 # Parse args
 AGENT=""
 URL=""
-
 while [[ $# -gt 0 ]]; do
     if [[ "$1" == "-user_agent" ]]; then
         AGENT="$2"
@@ -35,6 +34,7 @@ PROBE=$(ffprobe -user_agent "$AGENT" -v quiet -print_format json -show_streams "
 VCODEC=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .codec_name' | head -n1)
 FPS_FRAC=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .r_frame_rate' | head -n1)
 ABITRATE_RAW=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .bit_rate // empty' | head -n1)
+ACHANNELS=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .channels // empty' | head -n1)
 
 # Validate video stream
 if [[ -z "$VCODEC" || "$VCODEC" == "null" ]]; then
@@ -64,6 +64,28 @@ else
     ABITRATE="128000"
 fi
 
+# Set channel layout based on channel count
+CHANNEL_LAYOUT=""
+case "$ACHANNELS" in
+    1)
+        CHANNEL_LAYOUT="-channel_layout mono"
+        ;;
+    2)
+        CHANNEL_LAYOUT="-channel_layout stereo"
+        ;;
+    6)
+        CHANNEL_LAYOUT="-channel_layout 5.1"
+        ;;
+    8)
+        CHANNEL_LAYOUT="-channel_layout 7.1"
+        ;;
+    *)
+        # No audio detected OR unknown channel count - force stereo for compatibility
+        CHANNEL_LAYOUT="-ac 2 -channel_layout stereo"
+        ACHANNELS="${ACHANNELS:-0} -> 2 (forced)"
+        ;;
+esac
+
 # Bitrates
 VBITRATE="8000000"
 MAXRATE="10000000"
@@ -89,7 +111,7 @@ else
 fi
 
 # Single combined log line
-echo "$LOG_PREFIX Detected $VCODEC @ $FPS_FRAC -> $VCODEC_OUT GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps" >&2
+echo "$LOG_PREFIX Detected $VCODEC @ $FPS_FRAC -> $VCODEC_OUT GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps ${ACHANNELS}ch" >&2
 
 # Execute ffmpeg
 exec ffmpeg \
@@ -120,6 +142,7 @@ exec ffmpeg \
   $TAG_ARGS \
   -c:a aac \
   -b:a "$ABITRATE" \
+  $CHANNEL_LAYOUT \
   -af "aresample=async=1" \
   -avoid_negative_ts make_zero \
   -start_at_zero \
