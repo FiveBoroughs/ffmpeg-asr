@@ -37,3 +37,20 @@ Video is passed through (not re-encoded) when:
 5. V4L2 M2M device (ARM boards) → V4L2M2M
 6. DRI device exists → VAAPI
 7. Nothing found → software
+
+## Benchmarking
+
+The auto-detected encoder isn't always the fastest for your setup. Intel QSV is often cited as faster than VAAPI, but in practice this varies - on some systems (particularly in containers), VAAPI outperforms QSV by 25-30%.
+
+Run the benchmark to find what works best on your hardware:
+
+```bash
+./benchmark-accel.sh [duration] [runs]
+./benchmark-accel.sh 10 3  # 10 seconds per test, 3 runs each
+```
+
+This downloads Jellyfin's demo video files (H.264, HEVC, HEVC 10-bit) and benchmarks all available encoders. Results are saved to `benchmark-results/`. Use the fastest encoder with `-accel`:
+
+```bash
+./ffmpeg-smart.sh -i "stream_url" -user_agent "UA" -accel vaapi
+```
