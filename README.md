@@ -4,7 +4,11 @@ Adaptive stream re-encoder with automatic hardware acceleration detection.
 
 ## What it does
 
-Wraps ffmpeg to transcode streams with hardware acceleration when available. Auto-detects your GPU and picks the right encoder. Passes through content that shouldn't be re-encoded (4K, HDR, 10-bit by default).
+Wraps ffmpeg to transcode streams with hardware acceleration. On first run, probes your hardware to find working encoders and caches the optimal settings. Automatically handles:
+
+- Hardware encoder selection (NVENC, VAAPI, QSV, VideoToolbox)
+- 10-bit input conversion for H264 encoders
+- Passthrough for 4K, HDR, and unsupported formats
 
 ## Usage
 
@@ -21,8 +25,10 @@ Outputs MPEG-TS to stdout.
 | `-i` | (required) | Input URL or file |
 | `-user_agent` | | User agent for HTTP streams |
 | `-accel` | auto | Hardware acceleration: `qsv`, `vaapi`, `nvenc`, `videotoolbox`, `v4l2m2m`, `software` |
-| `-vc` | `h264` | Output codec: `h264` (faster) or `hevc` (smaller files) |
-| `-10bit` | off | Enable 10-bit encoding (for capable hardware) |
+| `-vc` | auto | Output codec: `h264` (faster) or `hevc` (smaller files) |
+| `-10bit` | auto | Enable 10-bit encoding (for capable hardware) |
+| `-hdr` | auto | Enable HDR re-encoding (requires 10-bit HEVC) |
+| `--recache` | | Force re-probe encoder capabilities |
 
 ### Examples
 
@@ -51,8 +57,56 @@ Outputs MPEG-TS to stdout.
 
 Video is passed through (not re-encoded) when:
 - Resolution is 4K or higher
-- 10-bit content (unless `-10bit` flag is set)
-- HDR (PQ or HLG transfer functions)
+- 10-bit content when hardware can't encode 10-bit
+- HDR content when hardware can't encode HDR (requires 10-bit HEVC)
+
+## 10-bit and HDR handling
+
+The script automatically handles 10-bit and HDR input based on hardware capabilities:
+
+| Input | Output Codec | Hardware Support | Result |
+|-------|--------------|------------------|--------|
+| 10-bit | H264 | any | Convert to 8-bit (H264 can't encode 10-bit) |
+| 10-bit | HEVC | 10-bit encode | Keep 10-bit |
+| 10-bit | HEVC | no 10-bit encode | Passthrough |
+| HDR | HEVC | 10-bit encode | Re-encode with HDR metadata preserved |
+| HDR | HEVC | no 10-bit encode | Passthrough |
+| HDR | H264 | any | Passthrough (H264 doesn't support HDR) |
+
+Conversion uses hardware scalers (`scale_cuda`, `scale_vaapi`, etc.) to stay on GPU.
+
+## Capability caching
+
+On first run, the script:
+1. Downloads a 10-bit HEVC probe sample (~4MB from Jellyfin)
+2. Tests each encoder with real hwaccel decode/encode pipeline
+3. Caches results to `.capabilities.cache`
+
+```
+.capabilities.cache   # Cached encoder test results
+probe-sample.mkv      # Jellyfin 10-bit HEVC demo clip
+```
+
+Example cache:
+```bash
+HW_FINGERPRINT='0x10de:0x2216;nvidia:NVIDIA_GeForce_RTX_3080;'
+BEST_ACCEL='nvenc'
+BEST_CODEC='h264'
+SUPPORTS_10BIT_DECODE='true'
+SUPPORTS_10BIT_ENCODE='true'
+ENCODERS='h264_nvenc=1;hevc_nvenc=1;hevc_nvenc_10bit=1;libx264=1;libx265=1;'
+```
+
+The cache auto-invalidates when GPU hardware changes. Use `--recache` to force re-probe.
+
+### Docker usage
+
+The cache lives in the script directory, so just mount the whole folder:
+
+```yaml
+volumes:
+  - /path/to/ffmpeg-smart:/app
+```
 
 ## Hardware detection order
 

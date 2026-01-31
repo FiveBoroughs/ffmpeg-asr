@@ -1,2 +1,4 @@
 benchmark-results/
 benchmark-samples/
+.capabilities.cache
+probe-sample.mkv

@@ -3,14 +3,249 @@ if [ -z "$BASH_VERSION" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
 LOG_PREFIX="[ffmpeg-smart]"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="09adc9b"  # git commit
+CACHE_FILE="$SCRIPT_DIR/.capabilities.cache"
+PROBE_SAMPLE="$SCRIPT_DIR/probe-sample.mkv"
+PROBE_SAMPLE_URL="https://repo.jellyfin.org/archive/jellyfish/media/jellyfish-3-mbps-hd-hevc-10bit.mkv"
+
+# Get hardware fingerprint (GPU vendor:device)
+get_hw_fingerprint() {
+    local fp=""
+    # Linux DRI devices
+    for d in /sys/class/drm/card*/device; do
+        if [[ -r "$d/vendor" && -r "$d/device" ]]; then
+            fp+="$(cat "$d/vendor" 2>/dev/null):$(cat "$d/device" 2>/dev/null);"
+        fi
+    done
+    # NVIDIA
+    [[ -e /dev/nvidia0 ]] && fp+="nvidia:$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | head -1 | tr ' ' '_');"
+    # macOS
+    [[ "$(uname -s)" == "Darwin" ]] && fp+="darwin:$(system_profiler SPDisplaysDataType 2>/dev/null | grep 'Chip' | head -1 | tr ' ' '_');"
+    # Fallback
+    [[ -z "$fp" ]] && fp="software"
+    echo "$fp"
+}
+
+# Download probe sample if needed (~4MB jellyfish 10-bit HEVC)
+ensure_probe_sample() {
+    [[ -f "$PROBE_SAMPLE" ]] && return 0
+    echo "$LOG_PREFIX Downloading probe sample (~4MB)..." >&2
+    curl -fsSL -o "$PROBE_SAMPLE" "$PROBE_SAMPLE_URL" 2>/dev/null || {
+        echo "$LOG_PREFIX WARNING: Failed to download probe sample, using synthetic test" >&2
+        return 1
+    }
+}
+
+# Quick encoder test (few frames) - returns 0 if works
+test_encoder() {
+    local encoder="$1"
+    local test_10bit="${2:-false}"
+    local hwaccel_args=()
+    local input_args=()
+    local filter_args=()
+
+    # Use real sample if available, otherwise synthetic
+    if [[ -f "$PROBE_SAMPLE" ]]; then
+        input_args=(-t 0.5 -i "$PROBE_SAMPLE")
+    else
+        input_args=(-f lavfi -i "testsrc=duration=0.5:size=320x240")
+    fi
+
+    # Set up hwaccel decode + encode pipeline
+    # Note: probe sample is 10-bit HEVC, so h264 encoders need format conversion to 8-bit
+    case "$encoder" in
+        h264_qsv)
+            hwaccel_args=(-hwaccel qsv -hwaccel_output_format qsv)
+            filter_args=(-vf "scale_qsv=format=nv12")
+            ;;
+        hevc_qsv)
+            hwaccel_args=(-hwaccel qsv -hwaccel_output_format qsv)
+            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_qsv=format=p010le")
+            ;;
+        h264_vaapi)
+            hwaccel_args=(-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}")
+            filter_args=(-vf "scale_vaapi=format=nv12")
+            ;;
+        hevc_vaapi)
+            hwaccel_args=(-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}")
+            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_vaapi=format=p010")
+            ;;
+        h264_nvenc)
+            hwaccel_args=(-hwaccel cuda -hwaccel_output_format cuda)
+            filter_args=(-vf "scale_cuda=format=nv12")
+            ;;
+        hevc_nvenc)
+            hwaccel_args=(-hwaccel cuda -hwaccel_output_format cuda)
+            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_cuda=format=p010le")
+            ;;
+        *_v4l2m2m)
+            hwaccel_args=()
+            filter_args=(-pix_fmt nv12)
+            ;;
+        *_videotoolbox)
+            hwaccel_args=(-hwaccel videotoolbox)
+            ;;
+        *)
+            hwaccel_args=()
+            ;;
+    esac
+
+    timeout 10s ffmpeg -hide_banner -v error \
+        "${hwaccel_args[@]}" "${input_args[@]}" \
+        "${filter_args[@]}" -c:v "$encoder" -f null - 2>/dev/null
+}
+
+# Test if hwaccel can decode 10-bit HEVC
+test_10bit_decode() {
+    local accel="$1"
+    local hwaccel_args=()
+
+    [[ ! -f "$PROBE_SAMPLE" ]] && return 1
+
+    case "$accel" in
+        qsv) hwaccel_args=(-hwaccel qsv -hwaccel_output_format qsv) ;;
+        vaapi) hwaccel_args=(-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}") ;;
+        nvenc) hwaccel_args=(-hwaccel cuda -hwaccel_output_format cuda) ;;
+        videotoolbox) hwaccel_args=(-hwaccel videotoolbox) ;;
+        *) return 1 ;;  # software doesn't need this test
+    esac
+
+    timeout 5s ffmpeg -hide_banner -v error \
+        "${hwaccel_args[@]}" -t 0.2 -i "$PROBE_SAMPLE" \
+        -f null - 2>/dev/null
+}
+
+# Probe all encoder capabilities
+probe_capabilities() {
+    local results=""
+    local encoders_list
+    encoders_list=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+
+    # Try to get real sample for better probe accuracy
+    ensure_probe_sample || true
+
+    # Test matrix: accel -> codecs
+    local accels_to_test=()
+    local can_decode_10bit=""
+
+    # Detect what to test based on hardware
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        accels_to_test+=("videotoolbox")
+    else
+        [[ -e /dev/nvidia0 ]] && accels_to_test+=("nvenc")
+        if [[ -e /dev/dri/renderD128 ]]; then
+            for v in /sys/class/drm/renderD*/device/vendor; do
+                [[ -r "$v" ]] || continue
+                case "$(cat "$v" 2>/dev/null)" in
+                    0x8086) accels_to_test+=("qsv" "vaapi") ;;
+                    0x1002) accels_to_test+=("vaapi") ;;
+                esac
+                break
+            done
+        fi
+        # V4L2 M2M (ARM: Raspberry Pi, Rockchip, etc.)
+        for n in /sys/class/video4linux/video*/name; do
+            if [[ -r "$n" ]] && grep -qiE 'm2m|codec' "$n" 2>/dev/null; then
+                accels_to_test+=("v4l2m2m")
+                break
+            fi
+        done
+    fi
+    accels_to_test+=("software")
+
+    local best_accel="software"
+    local best_codec="h264"
+    local supports_10bit_decode="false"
+    local supports_10bit_encode="false"
+
+    for accel in "${accels_to_test[@]}"; do
+        # Test 10-bit decode for this accelerator
+        if [[ "$accel" != "software" ]] && test_10bit_decode "$accel"; then
+            can_decode_10bit+="${accel}=1;"
+            supports_10bit_decode="true"
+        fi
+
+        for codec in h264 hevc; do
+            local encoder
+            if [[ "$accel" == "software" ]]; then
+                [[ "$codec" == "h264" ]] && encoder="libx264" || encoder="libx265"
+            else
+                encoder="${codec}_${accel}"
+            fi
+
+            # Skip if encoder not compiled in
+            grep -qw "$encoder" <<<"$encoders_list" || continue
+
+            echo "$LOG_PREFIX Probing $encoder..." >&2
+            if test_encoder "$encoder"; then
+                results+="${encoder}=1;"
+                # First working HW encoder wins as best
+                if [[ "$accel" != "software" && "$best_accel" == "software" ]]; then
+                    best_accel="$accel"
+                    best_codec="$codec"
+                fi
+
+                # Test 10-bit encode for HEVC (skip QSV - known broken)
+                if [[ "$codec" == "hevc" && "$accel" != "software" && "$accel" != "qsv" ]]; then
+                    if test_encoder "$encoder" "true"; then
+                        results+="${encoder}_10bit=1;"
+                        supports_10bit_encode="true"
+                    fi
+                fi
+            else
+                results+="${encoder}=0;"
+            fi
+        done
+    done
+
+    echo "BEST_ACCEL='$best_accel'"
+    echo "BEST_CODEC='$best_codec'"
+    echo "SUPPORTS_10BIT_DECODE='$supports_10bit_decode'"
+    echo "SUPPORTS_10BIT_ENCODE='$supports_10bit_encode'"
+    echo "DECODE_10BIT='$can_decode_10bit'"
+    echo "ENCODERS='$results'"
+}
+
+# Load cached capabilities (returns 1 if cache invalid)
+load_cache() {
+    [[ -f "$CACHE_FILE" ]] || return 1
+
+    # Source first to get variables
+    source "$CACHE_FILE" || return 1
+
+    # Check fingerprint matches
+    local current_fp
+    current_fp=$(get_hw_fingerprint)
+    [[ "$HW_FINGERPRINT" == "$current_fp" ]] || return 1
+
+    return 0
+}
+
+# Save capabilities to cache
+save_cache() {
+    echo "$LOG_PREFIX v$VERSION | Probing encoder capabilities..." >&2
+    {
+        echo "# ffmpeg-smart capability cache"
+        echo "# Generated: $(date -Iseconds)"
+        echo "HW_FINGERPRINT='$(get_hw_fingerprint)'"
+        probe_capabilities
+    } > "$CACHE_FILE"
+    source "$CACHE_FILE"
+}
 
 # Parse args
 AGENT=""
 URL=""
-VCODEC_OUT="h264"  # h264 (faster) or hevc (smaller)
-ALLOW_10BIT=false  # set true if hardware supports 10-bit encoding
+VCODEC_OUT=""  # empty = use cached best
+ALLOW_10BIT="" # empty = use cached value
+ALLOW_HDR=""   # empty = use cached value
+RECACHE=false
 
-# Auto-detect default accel based on available hardware
+# Placeholder - will be set from cache or detect_accel fallback
+ACCEL="__auto__"
+
+# Fallback accel detection (only used if cache fails)
 detect_accel() {
     # macOS - VideoToolbox
     if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -41,7 +276,6 @@ detect_accel() {
         echo "software"
     fi
 }
-ACCEL=$(detect_accel)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,9 +284,27 @@ while [[ $# -gt 0 ]]; do
         -accel) ACCEL="$2"; shift 2 ;;
         -vc) VCODEC_OUT="$2"; shift 2 ;;
         -10bit) ALLOW_10BIT=true; shift ;;
+        -hdr) ALLOW_HDR=true; shift ;;
+        --recache) RECACHE=true; shift ;;
         *) shift ;;
     esac
 done
+
+# Initialize capabilities from cache (or probe if needed)
+if [[ "$RECACHE" == "true" ]] || ! load_cache 2>/dev/null; then
+    save_cache
+else
+    echo "$LOG_PREFIX v$VERSION | Cached: accel=$BEST_ACCEL codec=$BEST_CODEC 10bit=$SUPPORTS_10BIT_ENCODE hdr=$SUPPORTS_10BIT_ENCODE" >&2
+fi
+
+# Apply cached defaults if not overridden by args
+[[ -z "$VCODEC_OUT" ]] && VCODEC_OUT="${BEST_CODEC:-h264}"
+[[ -z "$ALLOW_10BIT" || "$ALLOW_10BIT" == "" ]] && ALLOW_10BIT="${SUPPORTS_10BIT_ENCODE:-false}"
+[[ -z "$ALLOW_HDR" || "$ALLOW_HDR" == "" ]] && ALLOW_HDR="${SUPPORTS_10BIT_ENCODE:-false}"  # HDR requires 10-bit encode
+if [[ "$ACCEL" == "__auto__" ]]; then
+    ACCEL="${BEST_ACCEL:-}"
+    [[ -z "$ACCEL" ]] && ACCEL=$(detect_accel)
+fi
 
 # Validate
 if [[ -z "$URL" ]]; then
@@ -152,14 +404,17 @@ ACHANNELS=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .
 
 # Passthrough conditions:
 # - 4K+ resolution (no point re-encoding)
-# - 10-bit content on QSV (can't encode properly)
-# - HDR content (preserve HDR, don't tone map)
+# - 10-bit content when can't encode 10-bit
+# - HDR content when can't encode HDR (requires 10-bit HEVC)
 PASSTHROUGH=""
+IS_HDR=false
+[[ "$COLOR_TRANSFER" == "smpte2084" || "$COLOR_TRANSFER" == "arib-std-b67" ]] && IS_HDR=true
+
 if [[ "$WIDTH" -ge 3840 || "$HEIGHT" -ge 2160 ]]; then
     PASSTHROUGH="4K+"
 elif [[ "$PIX_FMT" == *"10"* && "$ALLOW_10BIT" == "false" ]]; then
     PASSTHROUGH="10-bit"
-elif [[ "$COLOR_TRANSFER" == "smpte2084" || "$COLOR_TRANSFER" == "arib-std-b67" ]]; then
+elif [[ "$IS_HDR" == "true" && "$ALLOW_HDR" == "false" ]]; then
     PASSTHROUGH="HDR"
 fi
 
@@ -194,6 +449,25 @@ fi
 # Set hwaccel args and encoder-specific options
 set_hwaccel_args
 set_encoder_opts
+
+# Handle 10-bit input: H264 needs conversion to 8-bit, HEVC can keep 10-bit if supported
+VF_ARGS=""
+if [[ "$PIX_FMT" == *"10"* && "$VCODEC_OUT" == "h264" ]]; then
+    # H264 can't encode 10-bit, must convert to 8-bit
+    case "$ACCEL" in
+        nvenc) VF_ARGS="-vf scale_cuda=format=nv12" ;;
+        vaapi) VF_ARGS="-vf scale_vaapi=format=nv12" ;;
+        qsv) VF_ARGS="-vf scale_qsv=format=nv12" ;;
+        *) VF_ARGS="-pix_fmt yuv420p" ;;
+    esac
+fi
+
+# HDR metadata passthrough (only for HEVC, H264 doesn't support HDR)
+HDR_ARGS=""
+if [[ "$IS_HDR" == "true" && "$VCODEC_OUT" == "hevc" && "$ALLOW_HDR" == "true" ]]; then
+    # Preserve HDR color metadata
+    HDR_ARGS="-color_primaries bt2020 -color_trc $COLOR_TRANSFER -colorspace bt2020nc"
+fi
 
 # Validate audio bitrate (reject sample rates like 44100/48000)
 # Audio bitrate: use source if valid, else 64kbps per channel
@@ -280,6 +554,8 @@ exec ffmpeg \
     -map 0:v:0 \
     -map 0:a:0? \
     -c:v "$ENCODER" \
+    $VF_ARGS \
+    $HDR_ARGS \
     -b:v "$VBITRATE" \
     -maxrate "$MAXRATE" \
     -bufsize "$BUFSIZE" \

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Update VERSION in ffmpeg-smart.sh after commit
+
+SCRIPT="ffmpeg-smart.sh"
+COMMIT=$(git rev-parse --short HEAD)
+
+# Update version to current commit
+sed -i "s/^VERSION=\"[^\"]*\"/VERSION=\"$COMMIT\"/" "$SCRIPT"
+
+# Stage but don't commit (will be included in next commit)
+# Or use --amend if you want it in this commit:
+# git add "$SCRIPT" && git commit --amend --no-edit --no-verify
