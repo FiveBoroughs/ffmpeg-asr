@@ -7,6 +7,9 @@ LOG_PREFIX="[ffmpeg-smart]"
 # Parse args
 AGENT=""
 URL=""
+VCODEC_OUT="h264"  # h264 (faster) or hevc (smaller)
+ALLOW_10BIT=false  # set true if hardware supports 10-bit encoding
+
 # Auto-detect default accel based on available hardware
 detect_accel() {
     # macOS - VideoToolbox
@@ -45,6 +48,8 @@ while [[ $# -gt 0 ]]; do
         -user_agent) AGENT="$2"; shift 2 ;;
         -i) URL="$2"; shift 2 ;;
         -accel) ACCEL="$2"; shift 2 ;;
+        -vc) VCODEC_OUT="$2"; shift 2 ;;
+        -10bit) ALLOW_10BIT=true; shift ;;
         *) shift ;;
     esac
 done
@@ -67,13 +72,19 @@ case "$ACCEL" in
         ;;
 esac
 
-# Set hwaccel args and encoder-specific options
+case "$VCODEC_OUT" in
+    h264|hevc) ;;
+    *)
+        echo "$LOG_PREFIX ERROR: Unknown video codec: $VCODEC_OUT (use: h264, hevc)" >&2
+        exit 1
+        ;;
+esac
+
+# Set hwaccel args (called early for decoding)
 set_hwaccel_args() {
-    ACCEL_OPTS=""
     case "$ACCEL" in
         qsv)
             HWACCEL_ARGS=( -hwaccel qsv -hwaccel_output_format qsv )
-            ACCEL_OPTS="-look_ahead 0"
             ;;
         vaapi)
             HWACCEL_ARGS=( -hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}" )
@@ -90,8 +101,41 @@ set_hwaccel_args() {
     esac
 }
 
+# Set encoder-specific options (called after encoder selection)
+set_encoder_opts() {
+    case "$ACCEL" in
+        qsv)
+            ACCEL_OPTS="-preset faster"
+            ;;
+        vaapi)
+            ACCEL_OPTS="-rc_mode VBR"
+            ;;
+        nvenc)
+            ACCEL_OPTS="-preset p4 -rc vbr"
+            ;;
+        videotoolbox)
+            ACCEL_OPTS="-realtime false"
+            ;;
+        software)
+            ACCEL_OPTS="-preset faster"
+            ;;
+        *)
+            ACCEL_OPTS=""
+            ;;
+    esac
+}
+
+# Build network-specific args (only for HTTP/HTTPS)
+if [[ "$URL" =~ ^https?:// ]]; then
+    [[ -n "$AGENT" ]] && UA_ARGS=(-user_agent "$AGENT") || UA_ARGS=()
+    NET_ARGS=(-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 30 -rw_timeout 15000000)
+else
+    UA_ARGS=()
+    NET_ARGS=()
+fi
+
 # Probe stream
-PROBE=$(ffprobe -user_agent "$AGENT" -v quiet -print_format json -show_streams "$URL" 2>&1) || {
+PROBE=$(ffprobe "${UA_ARGS[@]}" -v quiet -print_format json -show_streams "$URL" 2>&1) || {
     echo "$LOG_PREFIX ERROR: ffprobe failed - cannot access stream" >&2
     exit 1
 }
@@ -113,7 +157,7 @@ ACHANNELS=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .
 PASSTHROUGH=""
 if [[ "$WIDTH" -ge 3840 || "$HEIGHT" -ge 2160 ]]; then
     PASSTHROUGH="4K+"
-elif [[ "$PIX_FMT" == *"10"* && "$ACCEL" != "nvenc" ]]; then
+elif [[ "$PIX_FMT" == *"10"* && "$ALLOW_10BIT" == "false" ]]; then
     PASSTHROUGH="10-bit"
 elif [[ "$COLOR_TRANSFER" == "smpte2084" || "$COLOR_TRANSFER" == "arib-std-b67" ]]; then
     PASSTHROUGH="HDR"
@@ -125,45 +169,40 @@ if [[ -z "$VCODEC" || "$VCODEC" == "null" ]]; then
     exit 1
 fi
 
-# Select output video codec
+# Select encoder based on VCODEC_OUT family and acceleration
 if [[ "$ACCEL" == "software" ]]; then
-    if [[ "$VCODEC" == "hevc" ]] && grep -qw 'libx265' <<<"$ENCODERS"; then
-        VCODEC_OUT="libx265"
+    if [[ "$VCODEC_OUT" == "hevc" ]]; then
+        ENCODER="libx265"
         TAG_ARGS="-tag:v hvc1"
-    elif [[ "$VCODEC" == "vp9" ]] && grep -qw 'libvpx-vp9' <<<"$ENCODERS"; then
-        VCODEC_OUT="libvpx-vp9"
-        TAG_ARGS=""
     else
-        VCODEC_OUT="libx264"
+        ENCODER="libx264"
         TAG_ARGS=""
     fi
 else
-    if [[ "$VCODEC" == "hevc" ]] && grep -qw "hevc_${ACCEL}" <<<"$ENCODERS"; then
-        VCODEC_OUT="hevc_${ACCEL}"
-        TAG_ARGS="-tag:v hvc1"
-    elif [[ "$VCODEC" == "vp9" ]] && grep -qw "vp9_${ACCEL}" <<<"$ENCODERS"; then
-        VCODEC_OUT="vp9_${ACCEL}"
-        TAG_ARGS=""
-    elif [[ "$VCODEC" == "mpeg2video" ]] && grep -qw "mpeg2_${ACCEL}" <<<"$ENCODERS"; then
-        VCODEC_OUT="mpeg2_${ACCEL}"
-        TAG_ARGS=""
-    elif grep -qw "h264_${ACCEL}" <<<"$ENCODERS"; then
-        VCODEC_OUT="h264_${ACCEL}"
-        TAG_ARGS=""
-    else
-        echo "$LOG_PREFIX ERROR: No usable video encoder for accel=${ACCEL}" >&2
+    ENCODER="${VCODEC_OUT}_${ACCEL}"
+    if ! grep -qw "$ENCODER" <<<"$ENCODERS"; then
+        echo "$LOG_PREFIX ERROR: Encoder $ENCODER not available" >&2
         exit 1
+    fi
+    if [[ "$VCODEC_OUT" == "hevc" ]]; then
+        TAG_ARGS="-tag:v hvc1"
+    else
+        TAG_ARGS=""
     fi
 fi
 
-# Set hwaccel args (after probe so we can check for 10-bit)
+# Set hwaccel args and encoder-specific options
 set_hwaccel_args
+set_encoder_opts
 
 # Validate audio bitrate (reject sample rates like 44100/48000)
+# Audio bitrate: use source if valid, else 64kbps per channel
 if [[ -n "$ABITRATE_RAW" ]] && [[ "$ABITRATE_RAW" =~ ^[0-9]+$ ]] && [[ "$ABITRATE_RAW" -ge 60000 ]] && [[ "$ABITRATE_RAW" -le 500000 ]]; then
     ABITRATE="$ABITRATE_RAW"
 else
-    ABITRATE="128000"
+    ACHANNELS_NUM=${ACHANNELS:-2}
+    [[ "$ACHANNELS_NUM" =~ ^[0-9]+$ ]] || ACHANNELS_NUM=2
+    ABITRATE=$((64000 * ACHANNELS_NUM))
 fi
 
 # Set channel layout based on channel count
@@ -178,10 +217,12 @@ case "$ACHANNELS" in
         ;;
 esac
 
-# Bitrates
-VBITRATE="8000000"
-MAXRATE="10000000"
-BUFSIZE="20000000"
+# Video bitrate scaled quadratically by pixels (8Mbps base at 1080p, 2Mbps floor)
+BASE_VBITRATE=8000000
+VBITRATE=$((BASE_VBITRATE * WIDTH * HEIGHT / 1920 / 1080))
+[[ $VBITRATE -lt 2000000 ]] && VBITRATE=2000000
+MAXRATE=$((VBITRATE * 125 / 100))  # 1.25x
+BUFSIZE=$((VBITRATE * 2))
 
 # Calculate GOP with rounding
 if [[ "$FPS_FRAC" =~ ^([0-9]+)/([0-9]+)$ ]]; then
@@ -205,12 +246,8 @@ fi
 if [[ -n "$PASSTHROUGH" ]]; then
     echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> passthrough (${PASSTHROUGH}) audio=${ABITRATE}bps ${ACHANNELS}ch" >&2
     exec ffmpeg \
-        -user_agent "$AGENT" \
-        -reconnect 1 \
-        -reconnect_at_eof 1 \
-        -reconnect_streamed 1 \
-        -reconnect_delay_max 30 \
-        -rw_timeout 15000000 \
+        "${UA_ARGS[@]}" \
+        "${NET_ARGS[@]}" \
         -fflags +genpts+igndts+discardcorrupt \
         -err_detect ignore_err \
         -i "$URL" \
@@ -231,28 +268,23 @@ if [[ -n "$PASSTHROUGH" ]]; then
         pipe:1
 fi
 
-echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> $VCODEC_OUT GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps ${ACHANNELS}ch accel=${ACCEL}" >&2
+echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> $ENCODER GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps ${ACHANNELS}ch accel=${ACCEL}" >&2
 
 exec ffmpeg \
-    -user_agent "$AGENT" \
+    "${UA_ARGS[@]}" \
+    "${NET_ARGS[@]}" \
     "${HWACCEL_ARGS[@]}" \
-    -reconnect 1 \
-    -reconnect_at_eof 1 \
-    -reconnect_streamed 1 \
-    -reconnect_delay_max 30 \
-    -rw_timeout 15000000 \
     -fflags +genpts+igndts+discardcorrupt \
     -err_detect ignore_err \
     -i "$URL" \
     -map 0:v:0 \
     -map 0:a:0? \
-    -c:v "$VCODEC_OUT" \
-    -preset fast \
+    -c:v "$ENCODER" \
     -b:v "$VBITRATE" \
     -maxrate "$MAXRATE" \
     -bufsize "$BUFSIZE" \
     -g "$GOP" \
-    -bf 0 \
+    -bf 2 \
     ${ACCEL_OPTS} \
     -fps_mode cfr \
     -r "$FPS_OUT" \
