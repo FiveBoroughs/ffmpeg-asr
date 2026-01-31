@@ -1,4 +1,5 @@
 #!/bin/bash
+if [ -z "$BASH_VERSION" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
 # Benchmark hardware video encoders
@@ -87,7 +88,7 @@ get_hwaccel_args() {
             echo "-hwaccel qsv -hwaccel_output_format qsv"
             ;;
         vaapi)
-            echo "-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device \"${VAAPI_DEVICE:-/dev/dri/renderD128}\""
+            echo "-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device ${VAAPI_DEVICE:-/dev/dri/renderD128}"
             ;;
         videotoolbox)
             echo "-hwaccel videotoolbox"

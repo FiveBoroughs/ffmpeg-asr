@@ -1,4 +1,5 @@
 #!/bin/bash
+if [ -z "$BASH_VERSION" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
 LOG_PREFIX="[ffmpeg-smart]"
