@@ -162,6 +162,7 @@ run_encode() {
     local input="$1"
     local encoder="$2"
     local hwaccel_args="$3"
+    local encoder_opts="$4"
     local output_file="$RESULTS_DIR/test_output.ts"
     local log_file="$RESULTS_DIR/ffmpeg.log"
 
@@ -174,6 +175,11 @@ run_encode() {
     fi
     cmd+=(-i "$input" -t "$DURATION")
     cmd+=(-c:v "$encoder" -b:v 8000000 -maxrate 10000000 -bufsize 20000000 -g 30 -bf 0)
+    if [[ -n "$encoder_opts" ]]; then
+        local -a enc_opts
+        read -ra enc_opts <<< "$encoder_opts"
+        cmd+=("${enc_opts[@]}")
+    fi
     cmd+=(-an -f mpegts "$output_file")
 
     # Run and capture output (disable errexit for this block)
@@ -206,7 +212,7 @@ run_benchmarks() {
     local encoders=("$@")
     local results_csv="$RESULTS_DIR/results_$(date +%Y%m%d_%H%M%S).csv"
 
-    echo "source,encoder,accel,run,fps" > "$results_csv"
+    echo "source,encoder,accel,mode,run,fps" > "$results_csv"
 
     echo "=============================================="
     echo "Hardware Encoder Benchmark"
@@ -225,6 +231,12 @@ run_benchmarks() {
         echo "=== Source: $source ==="
 
         for accel in "${encoders[@]}"; do
+            # Determine power modes to test (vaapi/qsv support low_power)
+            local power_modes=("normal")
+            if [[ "$accel" == "vaapi" || "$accel" == "qsv" ]]; then
+                power_modes+=("low_power")
+            fi
+
             for codec in h264 hevc vp9; do
                 local encoder
                 encoder=$(get_encoder "$codec" "$accel")
@@ -237,33 +249,42 @@ run_benchmarks() {
                 local hwaccel_args
                 hwaccel_args=$(get_hwaccel_args "$accel")
 
-                printf "  %-20s " "$encoder"
-
-                local fps_sum=0
-                local fps_count=0
-                local failed=0
-
-                for run in $(seq 1 "$RUNS"); do
-                    fps=$(run_encode "$input" "$encoder" "$hwaccel_args" 2>/dev/null || echo "0")
-
-                    # Check for failure (0, empty, or very low fps indicating no actual encoding)
-                    if [[ -z "$fps" || "$fps" == "0" || "$fps" == "0.0" ]]; then
-                        failed=1
-                        break
+                for power_mode in "${power_modes[@]}"; do
+                    local encoder_opts=""
+                    local display_name="$encoder"
+                    if [[ "$power_mode" == "low_power" ]]; then
+                        encoder_opts="-low_power 1"
+                        display_name="${encoder}(lp)"
                     fi
 
-                    fps_sum=$(awk "BEGIN {print $fps_sum + $fps}")
-                    fps_count=$((fps_count + 1))
-                    echo "$source,$encoder,$accel,$run,$fps" >> "$results_csv"
-                done
+                    printf "  %-24s " "$display_name"
 
-                if [[ $failed -eq 1 ]]; then
-                    echo "FAILED"
-                else
-                    local avg
-                    avg=$(awk "BEGIN {printf \"%.1f\", $fps_sum / $fps_count}")
-                    echo "${avg} fps"
-                fi
+                    local fps_sum=0
+                    local fps_count=0
+                    local failed=0
+
+                    for run in $(seq 1 "$RUNS"); do
+                        fps=$(run_encode "$input" "$encoder" "$hwaccel_args" "$encoder_opts" 2>/dev/null || echo "0")
+
+                        # Check for failure (0, empty, or very low fps indicating no actual encoding)
+                        if [[ -z "$fps" || "$fps" == "0" || "$fps" == "0.0" ]]; then
+                            failed=1
+                            break
+                        fi
+
+                        fps_sum=$(awk "BEGIN {print $fps_sum + $fps}")
+                        fps_count=$((fps_count + 1))
+                        echo "$source,$encoder,$accel,$power_mode,$run,$fps" >> "$results_csv"
+                    done
+
+                    if [[ $failed -eq 1 ]]; then
+                        echo "FAILED"
+                    else
+                        local avg
+                        avg=$(awk "BEGIN {printf \"%.1f\", $fps_sum / $fps_count}")
+                        echo "${avg} fps"
+                    fi
+                done
             done
         done
         echo ""
@@ -280,14 +301,15 @@ run_benchmarks() {
 
     # Generate summary from CSV
     awk -F',' 'NR>1 {
-        key = $1 "," $2 "," $3
-        sum[key] += $5
+        mode_suffix = ($4 == "low_power") ? "(lp)" : ""
+        key = $1 "," $2 mode_suffix "," $3
+        sum[key] += $6
         count[key]++
     }
     END {
         for (k in sum) {
             split(k, a, ",")
-            printf "%-15s %-20s %8.1f fps\n", a[1], a[2], sum[k]/count[k]
+            printf "%-15s %-24s %8.1f fps\n", a[1], a[2], sum[k]/count[k]
         }
     }' "$results_csv" | sort
 }
