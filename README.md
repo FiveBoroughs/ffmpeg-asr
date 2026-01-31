@@ -49,7 +49,7 @@ Run the benchmark to find what works best on your hardware:
 ./benchmark-accel.sh 10 3  # 10 seconds per test, 3 runs each
 ```
 
-This downloads Jellyfin's demo video files (H.264, HEVC, HEVC 10-bit) and benchmarks all available encoders. Results are saved to `benchmark-results/`. Use the fastest encoder with `-accel`:
+This downloads Jellyfin's demo video files (H.264, HEVC, HEVC 10-bit) and benchmarks all available encoders. For VAAPI and QSV, both normal and low power modes are tested (low power uses the dedicated encode engine). Results are saved to `benchmark-results/`. Use the fastest encoder with `-accel`:
 
 ```bash
 ./ffmpeg-smart.sh -i "stream_url" -user_agent "UA" -accel vaapi

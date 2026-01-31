@@ -22,7 +22,7 @@ detect_accel() {
         [[ -r "$v" ]] || continue
         vendor=$(cat "$v" 2>/dev/null)
         case "$vendor" in
-            0x8086) echo "vaapi"; return ;; # Intel - vaapi is 25-30% faster than qsv
+            0x8086) echo "vaapi"; return ;; # Intel
             0x1002) echo "vaapi"; return ;; # AMD
         esac
     done
