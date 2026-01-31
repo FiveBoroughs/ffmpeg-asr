@@ -1,4 +1,5 @@
 #!/bin/bash
+if [ -z "$BASH_VERSION" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 
 # Benchmark ffmpeg-smart.sh against live streams and sample files

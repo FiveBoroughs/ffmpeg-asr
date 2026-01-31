@@ -92,10 +92,13 @@ Example cache:
 HW_FINGERPRINT='0x10de:0x2216;nvidia:NVIDIA_GeForce_RTX_3080;'
 BEST_ACCEL='nvenc'
 BEST_CODEC='h264'
+BEST_LOW_POWER='0'
 SUPPORTS_10BIT_DECODE='true'
 SUPPORTS_10BIT_ENCODE='true'
-ENCODERS='h264_nvenc=1;hevc_nvenc=1;hevc_nvenc_10bit=1;libx264=1;libx265=1;'
+ENCODERS='h264_nvenc=6.29x;hevc_nvenc=5.85x;hevc_nvenc_10bit=1;libx264=3.83x;libx265=3.24x;'
 ```
+
+The `ENCODERS` field shows benchmark speeds (e.g., `6.29x` = 6.29x realtime). Low power mode results appear as `encoder(lp)=speed` when available.
 
 The cache auto-invalidates when GPU hardware changes. Use `--recache` to force re-probe.
 
@@ -117,6 +120,22 @@ volumes:
 5. V4L2 M2M device (ARM boards) → V4L2M2M
 6. DRI device exists → VAAPI
 7. Nothing found → software
+
+## Intel low power mode
+
+Intel GPUs support a "low power" encoding mode (VDEnc) that can be faster than the standard encoder. The script benchmarks both modes and selects the faster one if it works.
+
+**Requirements for low power mode with VBR/CBR rate control:**
+- HuC (Hardware uCode) firmware must be loaded
+- Enable via kernel parameter: `i915.enable_guc=2`
+
+Without HuC, low power mode only supports CQP (constant quality), not VBR bitrate control. Since streaming requires VBR for bandwidth control, the script will fall back to normal encoding mode on systems without HuC.
+
+To check if HuC is loaded:
+```bash
+dmesg | grep -i huc
+# Should show: "HuC: authenticated"
+```
 
 ## Benchmarking
 

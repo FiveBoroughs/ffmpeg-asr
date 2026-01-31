@@ -4,7 +4,7 @@ set -euo pipefail
 
 LOG_PREFIX="[ffmpeg-smart]"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="09adc9b"  # git commit
+VERSION="7b4d717"  # git commit
 CACHE_FILE="$SCRIPT_DIR/.capabilities.cache"
 PROBE_SAMPLE="$SCRIPT_DIR/probe-sample.mkv"
 PROBE_SAMPLE_URL="https://repo.jellyfin.org/archive/jellyfish/media/jellyfish-3-mbps-hd-hevc-10bit.mkv"
@@ -37,63 +37,130 @@ ensure_probe_sample() {
     }
 }
 
-# Quick encoder test (few frames) - returns 0 if works
-test_encoder() {
+# Quick encoder benchmark - returns "speed:lp_speed" (e.g., "4.0:3.5" or "5.2:" if no lp)
+# Tests both normal and low_power modes for VAAPI/QSV
+bench_encoder() {
     local encoder="$1"
-    local test_10bit="${2:-false}"
-    local hwaccel_args=()
-    local input_args=()
-    local filter_args=()
+    local pix_fmt="nv12"
+    local size="1920x1080"
+    local duration="2"  # 2 seconds @ 30fps = 60 frames
+    local output speed
+    local lp_speed=""
 
-    # Use real sample if available, otherwise synthetic
-    if [[ -f "$PROBE_SAMPLE" ]]; then
-        input_args=(-t 0.5 -i "$PROBE_SAMPLE")
-    else
-        input_args=(-f lavfi -i "testsrc=duration=0.5:size=320x240")
-    fi
+    # Production-like encoder options for realistic benchmarking
+    local prod_opts="-b:v 8M -maxrate 10M -bufsize 16M -g 30 -bf 2"
+    # Low power mode: no B-frames, no look-ahead (VDEnc requirements)
+    local lp_prod_opts="-b:v 8M -maxrate 10M -bufsize 16M -g 30 -bf 0 -look_ahead 0"
 
-    # Set up hwaccel decode + encode pipeline
-    # Note: probe sample is 10-bit HEVC, so h264 encoders need format conversion to 8-bit
     case "$encoder" in
-        h264_qsv)
-            hwaccel_args=(-hwaccel qsv -hwaccel_output_format qsv)
-            filter_args=(-vf "scale_qsv=format=nv12")
+        *_qsv)
+            # Test normal mode with production settings
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -init_hw_device qsv=qsv:hw \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -vf "hwupload=extra_hw_frames=16" \
+                -c:v "$encoder" -preset faster $prod_opts -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
+            # Test low power mode (no preset, no B-frames)
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -init_hw_device qsv=qsv:hw \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -vf "hwupload=extra_hw_frames=16" \
+                -c:v "$encoder" -low_power true $lp_prod_opts -f null - 2>&1)
+            lp_speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
             ;;
-        hevc_qsv)
-            hwaccel_args=(-hwaccel qsv -hwaccel_output_format qsv)
-            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_qsv=format=p010le")
+        *_vaapi)
+            # Test normal mode with production settings
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}" \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -vf "hwupload,scale_vaapi=format=$pix_fmt" \
+                -c:v "$encoder" -rc_mode VBR $prod_opts -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
+            # Test low power mode (no B-frames)
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}" \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -vf "hwupload,scale_vaapi=format=$pix_fmt" \
+                -c:v "$encoder" -rc_mode VBR -low_power 1 $lp_prod_opts -f null - 2>&1)
+            lp_speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
             ;;
-        h264_vaapi)
-            hwaccel_args=(-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}")
-            filter_args=(-vf "scale_vaapi=format=nv12")
-            ;;
-        hevc_vaapi)
-            hwaccel_args=(-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}")
-            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_vaapi=format=p010")
-            ;;
-        h264_nvenc)
-            hwaccel_args=(-hwaccel cuda -hwaccel_output_format cuda)
-            filter_args=(-vf "scale_cuda=format=nv12")
-            ;;
-        hevc_nvenc)
-            hwaccel_args=(-hwaccel cuda -hwaccel_output_format cuda)
-            [[ "$test_10bit" == "true" ]] && filter_args=(-vf "scale_cuda=format=p010le")
-            ;;
-        *_v4l2m2m)
-            hwaccel_args=()
-            filter_args=(-pix_fmt nv12)
+        *_nvenc)
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -init_hw_device cuda=cuda -filter_hw_device cuda \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt,hwupload_cuda" \
+                -c:v "$encoder" -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
             ;;
         *_videotoolbox)
-            hwaccel_args=(-hwaccel videotoolbox)
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -c:v "$encoder" -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
+            ;;
+        *_v4l2m2m)
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30,format=$pix_fmt" \
+                -c:v "$encoder" -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
             ;;
         *)
-            hwaccel_args=()
+            # Software encoders - use faster preset for quick test
+            output=$(timeout 30s ffmpeg -hide_banner -benchmark \
+                -f lavfi -i "testsrc=size=$size:duration=$duration:rate=30" \
+                -c:v "$encoder" -preset ultrafast -f null - 2>&1)
+            speed=$(echo "$output" | grep -oP 'speed=\s*\K[0-9.]+(?=x)' | tail -1)
             ;;
     esac
 
-    timeout 10s ffmpeg -hide_banner -v error \
-        "${hwaccel_args[@]}" "${input_args[@]}" \
-        "${filter_args[@]}" -c:v "$encoder" -f null - 2>/dev/null
+    echo "${speed:-0}:${lp_speed}"
+}
+
+# Quick encoder test - returns 0 if works (used for 10-bit capability check)
+test_encoder() {
+    local encoder="$1"
+    local test_10bit="${2:-false}"
+    local pix_fmt="nv12"
+    [[ "$test_10bit" == "true" ]] && pix_fmt="p010le"
+    local size="256x256"
+
+    case "$encoder" in
+        *_qsv)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -init_hw_device qsv=qsv:hw \
+                -f lavfi -i "color=black:size=$size:duration=0.1,format=$pix_fmt" \
+                -vf "hwupload=extra_hw_frames=16" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+        *_vaapi)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}" \
+                -f lavfi -i "color=black:size=$size:duration=0.1,format=$pix_fmt" \
+                -vf "hwupload,scale_vaapi=format=$pix_fmt" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+        *_nvenc)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -init_hw_device cuda=cuda -filter_hw_device cuda \
+                -f lavfi -i "color=black:size=$size:duration=0.1,format=$pix_fmt,hwupload_cuda" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+        *_videotoolbox)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -f lavfi -i "color=black:size=$size:duration=0.1,format=$pix_fmt" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+        *_v4l2m2m)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -f lavfi -i "color=black:size=$size:duration=0.1,format=$pix_fmt" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+        *)
+            timeout 10s ffmpeg -hide_banner -v error \
+                -f lavfi -i "color=black:size=$size:duration=0.1" \
+                -c:v "$encoder" -f null - 2>/dev/null
+            ;;
+    esac
 }
 
 # Test if hwaccel can decode 10-bit HEVC
@@ -156,6 +223,8 @@ probe_capabilities() {
 
     local best_accel="software"
     local best_codec="h264"
+    local best_speed="0"
+    local best_low_power="0"
     local supports_10bit_decode="false"
     local supports_10bit_encode="false"
 
@@ -177,13 +246,35 @@ probe_capabilities() {
             # Skip if encoder not compiled in
             grep -qw "$encoder" <<<"$encoders_list" || continue
 
-            echo "$LOG_PREFIX Probing $encoder..." >&2
-            if test_encoder "$encoder"; then
-                results+="${encoder}=1;"
-                # First working HW encoder wins as best
-                if [[ "$accel" != "software" && "$best_accel" == "software" ]]; then
+            local bench_result speed lp_speed best_of_two use_lp
+            bench_result=$(bench_encoder "$encoder")
+            speed="${bench_result%%:*}"
+            lp_speed="${bench_result##*:}"
+
+            if [[ -n "$speed" && "$speed" != "0" ]]; then
+                # Store normal mode result
+                results+="${encoder}=${speed}x;"
+
+                # Store low power result if tested
+                if [[ -n "$lp_speed" && "$lp_speed" != "0" ]]; then
+                    results+="${encoder}(lp)=${lp_speed}x;"
+                fi
+
+                # Determine which mode is faster for this encoder
+                if [[ -n "$lp_speed" ]] && awk "BEGIN {exit !($lp_speed > $speed)}"; then
+                    best_of_two="$lp_speed"
+                    use_lp="1"
+                else
+                    best_of_two="$speed"
+                    use_lp="0"
+                fi
+
+                # Compare to overall best (use awk for float comparison)
+                if awk "BEGIN {exit !($best_of_two > $best_speed)}"; then
+                    best_speed="$best_of_two"
                     best_accel="$accel"
                     best_codec="$codec"
+                    best_low_power="$use_lp"
                 fi
 
                 # Test 10-bit encode for HEVC (skip QSV - known broken)
@@ -201,6 +292,7 @@ probe_capabilities() {
 
     echo "BEST_ACCEL='$best_accel'"
     echo "BEST_CODEC='$best_codec'"
+    echo "BEST_LOW_POWER='$best_low_power'"
     echo "SUPPORTS_10BIT_DECODE='$supports_10bit_decode'"
     echo "SUPPORTS_10BIT_ENCODE='$supports_10bit_encode'"
     echo "DECODE_10BIT='$can_decode_10bit'"
@@ -224,7 +316,6 @@ load_cache() {
 
 # Save capabilities to cache
 save_cache() {
-    echo "$LOG_PREFIX v$VERSION | Probing encoder capabilities..." >&2
     {
         echo "# ffmpeg-smart capability cache"
         echo "# Generated: $(date -Iseconds)"
@@ -293,6 +384,7 @@ done
 # Initialize capabilities from cache (or probe if needed)
 if [[ "$RECACHE" == "true" ]] || ! load_cache 2>/dev/null; then
     save_cache
+    echo "$LOG_PREFIX v$VERSION | Probed: accel=$BEST_ACCEL codec=$BEST_CODEC 10bit=$SUPPORTS_10BIT_ENCODE hdr=$SUPPORTS_10BIT_ENCODE" >&2
 else
     echo "$LOG_PREFIX v$VERSION | Cached: accel=$BEST_ACCEL codec=$BEST_CODEC 10bit=$SUPPORTS_10BIT_ENCODE hdr=$SUPPORTS_10BIT_ENCODE" >&2
 fi
@@ -355,12 +447,25 @@ set_hwaccel_args() {
 
 # Set encoder-specific options (called after encoder selection)
 set_encoder_opts() {
+    # Default: enable B-frames for better compression
+    BF_ARGS="-bf 2"
+
     case "$ACCEL" in
         qsv)
-            ACCEL_OPTS="-preset faster"
+            if [[ "${BEST_LOW_POWER:-0}" == "1" ]]; then
+                # Low power (VDEnc): no preset, no B-frames, no look-ahead
+                ACCEL_OPTS="-low_power true -look_ahead 0"
+                BF_ARGS="-bf 0"
+            else
+                ACCEL_OPTS="-preset faster"
+            fi
             ;;
         vaapi)
             ACCEL_OPTS="-rc_mode VBR"
+            if [[ "${BEST_LOW_POWER:-0}" == "1" ]]; then
+                ACCEL_OPTS+=" -low_power 1"
+                BF_ARGS="-bf 0"  # Low power mode doesn't support B-frames
+            fi
             ;;
         nvenc)
             ACCEL_OPTS="-preset p4 -rc vbr"
@@ -450,7 +555,9 @@ fi
 set_hwaccel_args
 set_encoder_opts
 
-# Handle 10-bit input: H264 needs conversion to 8-bit, HEVC can keep 10-bit if supported
+# Handle video filter requirements:
+# 1. 10-bit input for H264 output needs conversion to 8-bit
+# 2. Cross-codec transcode with VAAPI needs scale_vaapi for frame format compatibility
 VF_ARGS=""
 if [[ "$PIX_FMT" == *"10"* && "$VCODEC_OUT" == "h264" ]]; then
     # H264 can't encode 10-bit, must convert to 8-bit
@@ -459,6 +566,13 @@ if [[ "$PIX_FMT" == *"10"* && "$VCODEC_OUT" == "h264" ]]; then
         vaapi) VF_ARGS="-vf scale_vaapi=format=nv12" ;;
         qsv) VF_ARGS="-vf scale_qsv=format=nv12" ;;
         *) VF_ARGS="-pix_fmt yuv420p" ;;
+    esac
+elif [[ "$ACCEL" == "vaapi" || "$ACCEL" == "qsv" ]]; then
+    # VAAPI/QSV encode needs format conversion filter
+    # hwupload passthrough handles both hw decode (pass through) and sw decode fallback (upload)
+    case "$ACCEL" in
+        vaapi) VF_ARGS="-vf format=nv12|vaapi,hwupload,scale_vaapi=format=nv12" ;;
+        qsv) VF_ARGS="-vf scale_qsv=format=nv12" ;;
     esac
 fi
 
@@ -560,7 +674,7 @@ exec ffmpeg \
     -maxrate "$MAXRATE" \
     -bufsize "$BUFSIZE" \
     -g "$GOP" \
-    -bf 2 \
+    $BF_ARGS \
     ${ACCEL_OPTS} \
     -fps_mode cfr \
     -r "$FPS_OUT" \
