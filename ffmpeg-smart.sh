@@ -4,7 +4,7 @@ set -euo pipefail
 
 LOG_PREFIX="[ffmpeg-smart]"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="7b4d717"  # git commit
+VERSION="841fd67"  # git commit
 CACHE_FILE="$SCRIPT_DIR/.capabilities.cache"
 PROBE_SAMPLE="$SCRIPT_DIR/probe-sample.mkv"
 PROBE_SAMPLE_URL="https://repo.jellyfin.org/archive/jellyfish/media/jellyfish-3-mbps-hd-hevc-10bit.mkv"
@@ -662,6 +662,7 @@ exec ffmpeg \
     "${UA_ARGS[@]}" \
     "${NET_ARGS[@]}" \
     "${HWACCEL_ARGS[@]}" \
+    -reinit_filter 0 \
     -fflags +genpts+igndts+discardcorrupt \
     -err_detect ignore_err \
     -i "$URL" \
