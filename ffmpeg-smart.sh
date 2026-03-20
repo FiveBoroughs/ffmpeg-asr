@@ -504,6 +504,7 @@ PIX_FMT=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .pi
 COLOR_TRANSFER=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .color_transfer // empty' | head -n1)
 WIDTH=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .width // 0' | head -n1)
 HEIGHT=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="video") | .height // 0' | head -n1)
+ACODEC=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .codec_name // empty' | head -n1)
 ABITRATE_RAW=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .bit_rate // empty' | head -n1)
 ACHANNELS=$(echo "$PROBE" | jq -r '.streams[] | select(.codec_type=="audio") | .channels // empty' | head -n1)
 
@@ -605,6 +606,22 @@ case "$ACHANNELS" in
         ;;
 esac
 
+# Audio: passthrough if codec is MPEGTS-compatible, otherwise transcode to AAC
+AUDIO_PASSTHROUGH=false
+case "$ACODEC" in
+    aac|ac3|eac3|mp2|mp3)
+        AUDIO_PASSTHROUGH=true
+        ;;
+esac
+
+if [[ "$AUDIO_PASSTHROUGH" == "true" ]]; then
+    AUDIO_ARGS=(-c:a copy)
+    echo "$LOG_PREFIX Audio: $ACODEC passthrough (copy)" >&2
+else
+    AUDIO_ARGS=(-c:a aac -b:a "$ABITRATE" $CHANNEL_LAYOUT -af "aresample=async=1")
+    echo "$LOG_PREFIX Audio: $ACODEC -> aac transcode (${ABITRATE}bps ${ACHANNELS}ch)" >&2
+fi
+
 # Video bitrate scaled quadratically by pixels (8Mbps base at 1080p, 2Mbps floor)
 BASE_VBITRATE=8000000
 VBITRATE=$((BASE_VBITRATE * WIDTH * HEIGHT / 1920 / 1080))
@@ -632,7 +649,7 @@ else
 fi
 
 if [[ -n "$PASSTHROUGH" ]]; then
-    echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> passthrough (${PASSTHROUGH}) audio=${ABITRATE}bps ${ACHANNELS}ch" >&2
+    echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> passthrough (${PASSTHROUGH}) audio=$ACODEC ${ACHANNELS}ch" >&2
     exec ffmpeg \
         "${UA_ARGS[@]}" \
         "${NET_ARGS[@]}" \
@@ -642,10 +659,7 @@ if [[ -n "$PASSTHROUGH" ]]; then
         -map 0:v:0 \
         -map 0:a:0? \
         -c:v copy \
-        -c:a aac \
-        -b:a "$ABITRATE" \
-        $CHANNEL_LAYOUT \
-        -af "aresample=async=1" \
+        "${AUDIO_ARGS[@]}" \
         -avoid_negative_ts make_zero \
         -start_at_zero \
         -mpegts_copyts 0 \
@@ -656,7 +670,7 @@ if [[ -n "$PASSTHROUGH" ]]; then
         pipe:1
 fi
 
-echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> $ENCODER GOP=$GOP${GOP_WARN} audio=${ABITRATE}bps ${ACHANNELS}ch accel=${ACCEL}" >&2
+echo "$LOG_PREFIX Detected ${WIDTH}x${HEIGHT} $VCODEC/$PIX_FMT @ $FPS_FRAC -> $ENCODER GOP=$GOP${GOP_WARN} audio=$ACODEC ${ACHANNELS}ch accel=${ACCEL}" >&2
 
 exec ffmpeg \
     "${UA_ARGS[@]}" \
@@ -680,10 +694,7 @@ exec ffmpeg \
     -fps_mode cfr \
     -r "$FPS_OUT" \
     $TAG_ARGS \
-    -c:a aac \
-    -b:a "$ABITRATE" \
-    $CHANNEL_LAYOUT \
-    -af "aresample=async=1" \
+    "${AUDIO_ARGS[@]}" \
     -avoid_negative_ts make_zero \
     -start_at_zero \
     -mpegts_copyts 0 \
