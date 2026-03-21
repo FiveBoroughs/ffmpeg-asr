@@ -606,7 +606,8 @@ case "$ACHANNELS" in
         ;;
 esac
 
-# Audio: passthrough if codec is MPEGTS-compatible, otherwise transcode to AAC
+# Audio: passthrough only when video is also passthrough (both keep original timestamps)
+# The transcode path always re-encodes audio with aresample=async=1 to maintain A/V sync with -fps_mode cfr
 AUDIO_PASSTHROUGH=false
 case "$ACODEC" in
     aac|ac3|eac3|mp2|mp3)
@@ -615,10 +616,10 @@ case "$ACODEC" in
 esac
 
 if [[ "$AUDIO_PASSTHROUGH" == "true" ]]; then
-    AUDIO_ARGS=(-c:a copy)
-    echo "$LOG_PREFIX Audio: $ACODEC passthrough (copy)" >&2
+    AUDIO_PASSTHROUGH_ARGS=(-c:a copy)
+    echo "$LOG_PREFIX Audio: $ACODEC passthrough (copy) when video passthrough" >&2
 else
-    AUDIO_ARGS=(-c:a aac -b:a "$ABITRATE" $CHANNEL_LAYOUT -af "aresample=async=1")
+    AUDIO_PASSTHROUGH_ARGS=(-c:a aac -b:a "$ABITRATE" $CHANNEL_LAYOUT -af "aresample=async=1")
     echo "$LOG_PREFIX Audio: $ACODEC -> aac transcode (${ABITRATE}bps ${ACHANNELS}ch)" >&2
 fi
 
@@ -659,7 +660,7 @@ if [[ -n "$PASSTHROUGH" ]]; then
         -map 0:v:0 \
         -map 0:a:0? \
         -c:v copy \
-        "${AUDIO_ARGS[@]}" \
+        "${AUDIO_PASSTHROUGH_ARGS[@]}" \
         -avoid_negative_ts make_zero \
         -start_at_zero \
         -mpegts_copyts 0 \
@@ -694,7 +695,10 @@ exec ffmpeg \
     -fps_mode cfr \
     -r "$FPS_OUT" \
     $TAG_ARGS \
-    "${AUDIO_ARGS[@]}" \
+    -c:a aac \
+    -b:a "$ABITRATE" \
+    $CHANNEL_LAYOUT \
+    -af "aresample=async=1" \
     -avoid_negative_ts make_zero \
     -start_at_zero \
     -mpegts_copyts 0 \
